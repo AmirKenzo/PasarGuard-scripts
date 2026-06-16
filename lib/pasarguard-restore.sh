@@ -1,5 +1,68 @@
 #!/usr/bin/env bash
 
+run_psql_restore() {
+    local container="$1" user="$2" password="$3" database_name="$4" sql_file="$5" log_file="$6"
+    local psql_output=""
+
+    psql_output=$(mktemp "${sql_file}.psql.XXXXXX") || return 1
+
+    echo "--- psql restore start: user=$user db=$database_name ---" >>"$log_file"
+    docker exec -i -e PGPASSWORD="$password" "$container" \
+        psql -v ON_ERROR_STOP=1 -U "$user" -d "$database_name" <"$sql_file" >"$psql_output" 2>&1
+    local psql_exit=$?
+    cat "$psql_output" >>"$log_file"
+    echo "--- psql restore end: exit=$psql_exit ---" >>"$log_file"
+
+    if [ "$psql_exit" -ne 0 ] || grep -qiE '^ERROR:|^FATAL:' "$psql_output"; then
+        colorized_echo red "psql restore failed."
+        grep -iE '^ERROR:|^FATAL:' "$psql_output" 2>/dev/null | tail -20
+        colorized_echo yellow "Last psql output:"
+        tail -15 "$psql_output" 2>/dev/null || true
+        echo "Last psql output:" >>"$log_file"
+        tail -30 "$psql_output" >>"$log_file"
+        rm -f "$psql_output"
+        return 1
+    fi
+
+    rm -f "$psql_output"
+    return 0
+}
+
+verify_postgres_restore() {
+    local container="$1" user="$2" password="$3" database_name="$4" log_file="$5"
+    local pg_table_count="" table_stats="" table_line="" table_name="" table_rows=""
+
+    pg_table_count=$(docker exec -e PGPASSWORD="$password" "$container" psql -U "$user" -d "$database_name" -At \
+        -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" \
+        2>>"$log_file" | tr -d '[:space:]')
+    if [ -z "$pg_table_count" ] || ! [[ "$pg_table_count" =~ ^[0-9]+$ ]] || [ "$pg_table_count" -eq 0 ]; then
+        colorized_echo red "Verification failed: no tables in database '$database_name'."
+        return 1
+    fi
+
+    colorized_echo green "Verified restore: $pg_table_count table(s) in database '$database_name':"
+    echo "Restored table row counts:" >>"$log_file"
+    table_stats=$(docker exec -e PGPASSWORD="$password" "$container" psql -U "$user" -d "$database_name" -At \
+        -c "SELECT table_name || '|' || (
+            xpath('/row/c/text()', query_to_xml(
+                format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
+                false, true, ''
+            ))
+        )[1]::text
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name;" 2>>"$log_file")
+    while IFS= read -r table_line; do
+        [ -z "$table_line" ] && continue
+        table_name="${table_line%%|*}"
+        table_rows="${table_line#*|}"
+        [ -z "$table_rows" ] && table_rows="?"
+        colorized_echo cyan "  - ${table_name}: ${table_rows} row(s)"
+        echo "  ${table_name}: ${table_rows}" >>"$log_file"
+    done <<<"$table_stats"
+    return 0
+}
+
 restore_command() {
     colorized_echo blue "Starting restore process..."
 
@@ -24,6 +87,8 @@ restore_command() {
     local current_backup_custom_enabled="false"
     local current_backup_db_type=""
     local current_backup_db_container=""
+    local current_pgadmin_email=""
+    local current_pgadmin_password=""
     local custom_restore_mode=false
     local sqlite_basename=""
 
@@ -71,6 +136,12 @@ restore_command() {
                 ;;
             BACKUP_DB_CONTAINER)
                 current_backup_db_container="$value"
+                ;;
+            PGADMIN_EMAIL)
+                current_pgadmin_email="$value"
+                ;;
+            PGADMIN_PASSWORD)
+                current_pgadmin_password="$value"
                 ;;
             esac
         done <"$ENV_FILE"
@@ -439,7 +510,7 @@ restore_command() {
 
     colorized_echo green "✓ Loaded $env_vars_loaded environment variables"
 
-    if is_backup_custom_enabled; then
+    if declare -F is_backup_custom_enabled >/dev/null 2>&1 && is_backup_custom_enabled; then
         custom_restore_mode=true
     fi
 
@@ -940,12 +1011,12 @@ restore_command() {
 
                 # Restore the filtered dump with ON_ERROR_STOP so psql exits non-zero on SQL errors
                 colorized_echo blue "Restoring database dump..."
-                if docker exec -i -e PGPASSWORD="$restore_password" "$container_name" psql -v ON_ERROR_STOP=1 -U "$restore_user" --dbname="$target_db_name" < "$temp_restore_dir/db_backup_filtered.sql" 2>>"$log_file"; then
+                if run_psql_restore "$container_name" "$restore_user" "$restore_password" "$target_db_name" "$temp_restore_dir/db_backup_filtered.sql" "$log_file"; then
                     restore_success=true
                 else
                     # Fallback: try with the configured admin user.
                     colorized_echo yellow "Trying with admin user..."
-                    if docker exec -i -e PGPASSWORD="$admin_password" "$container_name" psql -v ON_ERROR_STOP=1 -U "$admin_user" --dbname="$target_db_name" < "$temp_restore_dir/db_backup_filtered.sql" 2>>"$log_file"; then
+                    if run_psql_restore "$container_name" "$admin_user" "$admin_password" "$target_db_name" "$temp_restore_dir/db_backup_filtered.sql" "$log_file"; then
                         restore_success=true
                     fi
                 fi
@@ -957,35 +1028,50 @@ restore_command() {
                 colorized_echo blue "Calling timescaledb_post_restore()..."
                 docker exec -e PGPASSWORD="$admin_password" "$container_name" psql -U "$admin_user" --dbname="$target_db_name" \
                     -c "SELECT timescaledb_post_restore();" >>"$log_file" 2>&1
-
-                if [ "$restore_success" = true ]; then
-                    colorized_echo green "TimescaleDB database restored successfully."
-                fi
             else
                 # Plain PostgreSQL restore with ON_ERROR_STOP so psql exits non-zero on SQL errors
+                local restore_db_name_sql="${restore_db_name//\'/\'\'}"
+                local restore_db_name_ident="${restore_db_name//\"/\"\"}"
+                local restore_db_owner="${current_db_user:-$restore_user}"
+                local restore_db_owner_ident="${restore_db_owner//\"/\"\"}"
+                colorized_echo blue "Dropping and recreating database '$restore_db_name'..."
+                docker exec -e PGPASSWORD="$admin_password" "$container_name" psql -U "$admin_user" -d postgres \
+                    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$restore_db_name_sql' AND pid <> pg_backend_pid();" \
+                    >>"$log_file" 2>&1 || true
+                docker exec -e PGPASSWORD="$admin_password" "$container_name" psql -U "$admin_user" -d postgres \
+                    -c "DROP DATABASE IF EXISTS \"$restore_db_name_ident\";" >>"$log_file" 2>&1
+                docker exec -e PGPASSWORD="$admin_password" "$container_name" psql -U "$admin_user" -d postgres \
+                    -c "CREATE DATABASE \"$restore_db_name_ident\" OWNER \"$restore_db_owner_ident\";" >>"$log_file" 2>&1
                 colorized_echo blue "Attempting restore using app user '$restore_user' to database '$restore_db_name'..."
-                if docker exec -i -e PGPASSWORD="$restore_password" "$container_name" psql -v ON_ERROR_STOP=1 -U "$restore_user" -d "$restore_db_name" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
-                    colorized_echo green "$db_type database restored successfully."
+                if run_psql_restore "$container_name" "$restore_user" "$restore_password" "$restore_db_name" "$temp_restore_dir/db_backup.sql" "$log_file"; then
                     restore_success=true
                 else
                     # If that fails, try using the configured admin user.
                     colorized_echo yellow "Trying with admin user..."
-                    if docker exec -i -e PGPASSWORD="$admin_password" "$container_name" psql -v ON_ERROR_STOP=1 -U "$admin_user" -d "$restore_db_name" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
-                        colorized_echo green "$db_type database restored successfully."
+                    if run_psql_restore "$container_name" "$admin_user" "$admin_password" "$restore_db_name" "$temp_restore_dir/db_backup.sql" "$log_file"; then
                         restore_success=true
                     else
                         # Try restoring to postgres database (for pg_dumpall backups)
-                        if docker exec -i -e PGPASSWORD="$admin_password" "$container_name" psql -v ON_ERROR_STOP=1 -U "$admin_user" -d postgres < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
-                            colorized_echo green "$db_type database restored successfully."
+                        colorized_echo yellow "Trying restore against postgres database (pg_dumpall backups)..."
+                        if run_psql_restore "$container_name" "$admin_user" "$admin_password" "postgres" "$temp_restore_dir/db_backup.sql" "$log_file"; then
                             restore_success=true
                         fi
                     fi
                 fi
             fi
 
+            if [ "$restore_success" = true ]; then
+                if verify_postgres_restore "$container_name" "$restore_user" "$restore_password" "$restore_db_name" "$log_file"; then
+                    colorized_echo green "$db_type database restored successfully."
+                else
+                    restore_success=false
+                fi
+            fi
+
             if [ "$restore_success" = false ]; then
                 colorized_echo red "Failed to restore $db_type database."
-                colorized_echo yellow "Check log file for details: $log_file"
+                cp "$log_file" "$backup_dir/pasarguard_restore_error.log" 2>/dev/null || true
+                colorized_echo yellow "Full log: $backup_dir/pasarguard_restore_error.log"
                 rm -rf "$temp_restore_dir"
                 exit 1
             fi
@@ -1087,6 +1173,13 @@ restore_command() {
             replace_or_append_env_var "BACKUP_DB_CONTAINER" "$current_backup_db_container" false "$ENV_FILE"
             [ -n "$current_backup_db_type" ] && replace_or_append_env_var "BACKUP_DB_TYPE" "$current_backup_db_type" false "$ENV_FILE"
             replace_or_append_env_var "BACKUP_CUSTOM_ENABLED" "$current_backup_custom_enabled" false "$ENV_FILE"
+        fi
+
+        if [ -n "$current_pgadmin_email" ]; then
+            replace_or_append_env_var "PGADMIN_EMAIL" "$current_pgadmin_email" true "$ENV_FILE"
+        fi
+        if [ -n "$current_pgadmin_password" ]; then
+            replace_or_append_env_var "PGADMIN_PASSWORD" "$current_pgadmin_password" true "$ENV_FILE"
         fi
     fi
 
